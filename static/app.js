@@ -18,7 +18,7 @@ function rng(seed){return function(){seed|=0;seed=seed+0x6D2B79F5|0;let t=Math.i
 
 const S={companies:{},active:null,freq:'annual',selDate:null,unit:ls.get('ca-unit','auto'),tab:'overview',cmpOff:new Set(),fx:{},
   tbl:{income:{q:'',key:false,sort:null},balance:{q:'',key:false,sort:null},cashflow:{q:'',key:false,sort:null}},
-  ratioSel:'roe',ratioGroup:'All',s3tab:'bs',s3all:false,s3nil:false,ratioQ:'',ds:null,online:false,cached:[],loading:null,snapshot:null,upCur:'INR',upUnit:'1e7'};
+  ratioSel:'roe',ratioGroup:'All',s3tab:'bs',s3all:false,s3nil:false,irFilter:'key',irQ:'',ratioQ:'',ds:null,online:false,cached:[],loading:null,snapshot:null,upCur:'INR',upUnit:'1e7'};
 let SERVER=false;
 
 /* ---------- formatting ---------- */
@@ -945,19 +945,151 @@ function s3CSV(){const c=ctx();if(!c||!c.M)return;const{co,M,i}=c,k=S.s3tab||'bs
     ...rows.filter((r,j)=>vis[j]).map(r=>[r.lbl,...cols.map(q=>r.v&&isNum(r.v[q])?+(r.k==='eps'?r.v[q]:r.v[q]/d).toFixed(2):'')])]),
     `${shortName(co.name)}_${S3T[k].replace(/\W+/g,'_')}_Schedule_III.csv`)}
 
+/* ======================= Broker & analyst views · Investor presentations & transcripts ======================= */
+const EXTRA={};
+const isListed=co=>!!co&&!/^(DEMO|FILE-)/.test(co.symbol);
+async function loadExtra(kind,co){const key=kind+'|'+co.symbol,cur=EXTRA[key];if(cur&&(cur.state==='loading'||cur.state==='ok'))return;
+  if(!SERVER){EXTRA[key]={state:'error',msg:'This section needs the Company Analyser server — it is not available in an offline snapshot.'};return}
+  EXTRA[key]={state:'loading'};
+  try{const url=kind==='analyst'?`/api/analyst?symbol=${encodeURIComponent(co.symbol)}`:`/api/filings?symbol=${encodeURIComponent(co.symbol)}&name=${encodeURIComponent(co.name||'')}`;
+    const r=await fetch(url),d=await r.json();if(!r.ok||d.error)throw new Error(d.error||'Request failed');EXTRA[key]={state:'ok',d}}
+  catch(e){EXTRA[key]={state:'error',msg:e.message}}
+  if(S.active===co.symbol&&S.tab===(kind==='analyst'?'views':'ir'))render()}
+function extraState(kind,co){const x=EXTRA[kind+'|'+co.symbol];if(!x){loadExtra(kind,co);return EXTRA[kind+'|'+co.symbol]||{state:'loading'}}return x}
+const loadingCard=msg=>`<div class="card-lite loading" style="padding:36px;margin-bottom:16px"><div class="spinner"></div><p>${msg}</p></div>`;
+const errorCard=(msg,kind)=>`<div class="card-lite empty" style="padding:28px;margin-bottom:16px">⚠️ ${esc(msg)}<br><br><button class="btn" data-act="extra-retry" data-k="${kind}">🔄 Try again</button></div>`;
+const tile=(ic,label,val,sub,tone)=>`<div class="kpi"><div class="kpi-top"><span class="kpi-ico">${ic}</span><span>${esc(label)}</span></div><div class="kpi-val ${tone?tone+'-t':''}">${val}</div><div class="kpi-foot"><span class="vs">${sub||''}</span></div></div>`;
+function researchLinks(co){const sym=co.symbol,base=sym.replace(/\.(NS|BO)$/i,''),q=encodeURIComponent,L=[];
+  if(/\.(NS|BO)$/i.test(sym)){L.push(['📊','Screener.in — company page with concall transcripts & presentations',`https://www.screener.in/company/${q(base)}/consolidated/`]);
+    L.push(['🏛️','NSE — quote & corporate announcements',`https://www.nseindia.com/get-quotes/equity?symbol=${q(base)}`])}
+  L.push(['🗞️','Google News — brokerage target prices & recommendations',`https://news.google.com/search?q=${q(shortName(co.name)+' target price brokerage')}`]);
+  L.push(['📈','Yahoo Finance — analyst estimates page',`https://finance.yahoo.com/quote/${q(sym)}/analysis/`]);
+  return`<div class="linkgrid">${L.map(([i,t,u])=>`<a class="linkcard" href="${u}" target="_blank" rel="noopener noreferrer"><span class="li">${i}</span><span>${esc(t)}</span><span class="ext">↗</span></a>`).join('')}</div>
+   <div class="note" style="margin-top:8px">Links open external websites in a new tab. Broker research reports belong to the brokers and are not copied into this app.</div>`}
+
+/* ---------- analyst consensus ---------- */
+const REC5=[['strongBuy','Strong Buy','var(--pos)'],['buy','Buy','#84cc16'],['hold','Hold','var(--warn)'],['sell','Sell','#f97316'],['strongSell','Strong Sell','var(--neg)']];
+const PERIOD_L={'0m':'Now','-1m':'1 month ago','-2m':'2 months ago','-3m':'3 months ago'};
+const EST_L={'0q':'Current quarter','+1q':'Next quarter','0y':'Current financial year','+1y':'Next financial year'};
+function devsCard(d){return d.developments&&d.developments.length?card('v-devs','📰 Recent significant developments',`<ul class="insights">${d.developments.map(v=>`<li class="neu"><span class="ii">🗓️</span><span><b>${esc(v.date||'')}</b> — ${esc(v.headline)}</span></li>`).join('')}</ul><div class="note" style="margin-top:6px">Source: Yahoo Finance.</div>`,{span:12}):null}
+function analystCards(co,d){
+  const cur=d.currency||(co.info||{}).currency||'INR',sy=SYM[cur]||'',px=d.currentPrice,mean=d.recommendationMean;
+  const tone=isNum(mean)?(mean<=2.5?'pos':mean<=3.5?'neu':'neg'):'';
+  const up=v=>isNum(px)&&isNum(v)?(v/px-1)*100:null,upA=up(d.targetMean),pct=v=>isNum(v)?(v>=0?'+':'')+v.toFixed(1)+'%':'—';
+  const k=[tile('🧭','Consensus rating',d.recommendationKey?esc(d.recommendationKey.replace('_',' ').toUpperCase()):'—',isNum(mean)?`Score ${mean.toFixed(2)} (1 = Strong Buy · 5 = Strong Sell)`:'',tone),
+    tile('👥','Analysts covering',isNum(d.analysts)?Math.round(d.analysts):'—','Contributing price targets'),
+    tile('🎯','Average target price',isNum(d.targetMean)?sy+fmtNum(d.targetMean,cur,2):'—',isNum(d.targetMedian)?`Median ${sy}${fmtNum(d.targetMedian,cur,2)}`:''),
+    tile('📈','Upside to average target',pct(upA),isNum(px)?`From current price ${sy}${fmtNum(px,cur,2)}`:'',isNum(upA)?(upA>=0?'pos':'neg'):'')];
+  const lo=d.targetLow,hi=d.targetHigh,rng=isNum(lo)&&isNum(hi)&&hi>lo,at=v=>rng&&isNum(v)?clamp((v-lo)/(hi-lo)*100,0,100):null;
+  const scale=isNum(mean)?`<div class="scalebar"><i style="left:${clamp((mean-1)/4*100,0,100)}%"></i></div><div class="scalelab"><span>Strong Buy</span><span>Buy</span><span>Hold</span><span>Sell</span><span>Strong Sell</span></div>`:'';
+  const range=rng?`<div class="rangebar"><span class="rb-fill"></span>${isNum(at(px))?`<i class="rb-now" style="left:${at(px)}%" data-tip="Current price ${sy}${fmtNum(px,cur,2)}"></i>`:''}${isNum(at(d.targetMean))?`<i class="rb-avg" style="left:${at(d.targetMean)}%" data-tip="Average target ${sy}${fmtNum(d.targetMean,cur,2)}"></i>`:''}</div>
+    <div class="scalelab"><span>Low ${sy}${fmtNum(lo,cur,0)} (${pct(up(lo))})</span><span>High ${sy}${fmtNum(hi,cur,0)} (${pct(up(hi))})</span></div>
+    <div class="note">⚫ current price · 🔷 average target${isNum(px)&&px<lo?' · price is below the lowest target':isNum(px)&&px>hi?' · price is above the highest target':''}</div>`:'<div class="note">Price-target range not published.</div>';
+  const cards=[card('v-cons','🧭 Consensus & price targets',`<div class="note" style="margin-bottom:6px">Average recommendation</div>${scale}<div class="note" style="margin:14px 0 6px">Analyst price-target range</div>${range}`,{span:6})];
+  const tr=(d.trend||[]).slice().sort((a,b)=>(parseInt(a.period)||0)-(parseInt(b.period)||0));
+  if(tr.length){cards.push(chartCard('v-dist','📊 Analyst recommendations — last 4 months',{type:'bar',stacked:true,labels:tr.map(t=>PERIOD_L[t.period]||t.period),
+      series:REC5.map(([key,name,color])=>({name,color,data:tr.map(t=>t[key]||0)})),fmt:v=>Math.round(v)+'',tf:v=>Math.round(v)+' analysts'},{span:6}))}
+  if((d.estimates||[]).length){cards.push(card('v-est','🔮 Consensus estimates',`<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Period</th><th class="num">EPS estimate</th><th class="num">Low – High</th><th class="num">Analysts</th><th class="num">EPS growth</th><th class="num">Revenue estimate</th><th class="num">Revenue growth</th></tr></thead><tbody>
+    ${d.estimates.map(e=>`<tr><td><b>${EST_L[e.period]||esc(e.period)}</b><small class="note"> ${e.endDate?'· ends '+fmtDate(e.endDate):''}</small></td><td class="num"><b>${isNum(e.epsAvg)?sy+e.epsAvg.toFixed(2):'—'}</b></td>
+      <td class="num">${isNum(e.epsLow)&&isNum(e.epsHigh)?`${sy}${e.epsLow.toFixed(2)} – ${sy}${e.epsHigh.toFixed(2)}`:'—'}</td><td class="num">${isNum(e.epsAnalysts)?Math.round(e.epsAnalysts):'—'}</td>
+      <td class="num ${isNum(e.epsGrowth)?(e.epsGrowth>=0?'pos-t':'neg-t'):''}">${isNum(e.epsGrowth)?pct(e.epsGrowth*100):'—'}</td><td class="num">${isNum(e.revAvg)?fmtAmt(e.revAvg,cur):'—'}</td>
+      <td class="num ${isNum(e.revGrowth)?(e.revGrowth>=0?'pos-t':'neg-t'):''}">${isNum(e.revGrowth)?pct(e.revGrowth*100):'—'}</td></tr>`).join('')}</tbody></table></div>`,{span:12}))}
+  cards.push(card('v-changes','🏦 Rating changes by broking firms',(d.changes||[]).length?`<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Date</th><th>Firm</th><th>Action</th><th>Rating</th><th class="num">Price target</th></tr></thead><tbody>
+    ${d.changes.map(c=>{const act={up:'⬆️ Upgrade',down:'⬇️ Downgrade',init:'🆕 Initiated',main:'↔️ Maintained',reit:'🔁 Reiterated'}[c.action]||esc(c.action||'');
+      return`<tr><td>${esc(c.date||'')}</td><td><b>${esc(c.firm||'')}</b></td><td>${act}</td><td>${c.from&&c.from!==c.to?esc(c.from)+' → ':''}<b>${esc(c.to||'')}</b></td>
+      <td class="num">${isNum(c.target)?sy+fmtNum(c.target,cur,2):'—'}${isNum(c.priorTarget)&&isNum(c.target)&&c.priorTarget!==c.target?` <small class="note">(was ${sy}${fmtNum(c.priorTarget,cur,2)})</small>`:''}</td></tr>`}).join('')}</tbody></table></div>`
+    :`<div class="note">Yahoo Finance does not publish firm-by-firm rating changes for this stock (common for Indian listings). Record the broker views you receive in the tracker below, or use the research links.</div>`,{span:12}));
+  return{kpis:`<div class="kpis">${k.join('')}</div>`,cards}}
+
+/* ---------- my broker views tracker (saved in this browser) ---------- */
+const BV_KEY=sym=>'ca-bviews-'+sym;
+const RATINGS=['Strong Buy','Buy','Accumulate','Add','Outperform','Hold','Neutral','Reduce','Underperform','Sell'];
+const ratingTone=r=>/buy|accumulate|add|outperform/i.test(r)?'good':/sell|reduce|underperform/i.test(r)?'weak':'ok';
+function bvTracker(co,px,cur){const list=ls.get(BV_KEY(co.symbol),[]).slice().sort((a,b)=>(b.date||'').localeCompare(a.date||'')),sy=SYM[cur]||'';
+  const up=t=>isNum(px)&&isNum(t)?(t/px-1)*100:null,tg=list.map(v=>v.target).filter(isNum),avgT=tg.length?tg.reduce((a,b)=>a+b)/tg.length:null,cnt={good:0,ok:0,weak:0};
+  list.forEach(v=>cnt[ratingTone(v.rating)]++);const pct=v=>(v>=0?'+':'')+v.toFixed(1)+'%';
+  return`<div class="bv-form"><input data-bv="broker" placeholder="Broker / analyst — e.g. Motilal Oswal" maxlength="60">
+    <select data-bv="rating">${RATINGS.map(r=>`<option>${r}</option>`).join('')}</select>
+    <input data-bv="target" type="number" step="any" min="0" placeholder="Target price${sy?' ('+sy+')':''}">
+    <input data-bv="date" type="date" value="${new Date().toISOString().slice(0,10)}">
+    <input data-bv="link" type="url" placeholder="Link to report / article (optional)" maxlength="400">
+    <button class="btn primary sm" data-act="bv-add">➕ Add view</button></div>
+   ${list.length?`<div class="chips" style="margin:12px 0 10px"><span class="chip">🧾 ${list.length} view${list.length>1?'s':''}</span><span class="st good">🟢 ${cnt.good} buy-side</span><span class="st ok">🟡 ${cnt.ok} hold / neutral</span><span class="st weak">🔴 ${cnt.weak} sell-side</span>
+     ${isNum(avgT)?`<span class="chip acc">🎯 Average target ${sy}${fmtNum(avgT,cur,0)}${isNum(up(avgT))?` (${pct(up(avgT))} vs current price)`:''}</span>`:''}</div>
+   <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Date</th><th>Broker / analyst</th><th>Rating</th><th class="num">Target</th><th class="num">Upside</th><th>Source</th><th></th></tr></thead><tbody>
+   ${list.map(v=>{const u=up(v.target);return`<tr><td>${esc(v.date||'')}</td><td><b>${esc(v.broker)}</b></td><td><span class="st ${ratingTone(v.rating)}">${esc(v.rating)}</span></td>
+     <td class="num">${isNum(v.target)?sy+fmtNum(v.target,cur,2):'—'}</td><td class="num ${isNum(u)?(u>=0?'pos-t':'neg-t'):''}">${isNum(u)?pct(u):'—'}</td>
+     <td>${v.link?`<a href="${esc(v.link)}" target="_blank" rel="noopener noreferrer">Open ↗</a>`:''}</td><td><button class="ib" data-act="bv-del" data-id="${esc(v.id)}" title="Delete">🗑️</button></td></tr>`}).join('')}</tbody></table></div>
+   <div class="tbl-tools" style="margin-top:8px"><button class="btn sm" data-act="bv-csv">⬇️ Download CSV</button><span class="note">Saved in this browser only — not shared with anyone.</span></div>`
+   :'<div class="note" style="margin-top:10px">Record the views in broker reports you receive (broker, rating, target price). The app works out the upside from today’s price and summarises them. Saved in this browser only.</div>'}`}
+function bvAdd(btn){const c=btn.closest('.card'),co=activeCo();if(!c||!co)return;const g=k=>c.querySelector(`[data-bv="${k}"]`).value.trim();
+  const broker=g('broker'),target=parseFloat(g('target')),link=g('link');
+  if(!broker)return toast('✍️ Enter the broker or analyst name','warn');
+  if(link&&!/^https?:\/\//i.test(link))return toast('🔗 The link must start with http:// or https://','warn');
+  const list=ls.get(BV_KEY(co.symbol),[]);list.push({id:Date.now().toString(36)+Math.random().toString(36).slice(2,6),broker:broker.slice(0,60),rating:g('rating'),
+    target:isFinite(target)&&target>0?target:null,date:g('date')||new Date().toISOString().slice(0,10),link:link.slice(0,400)});
+  ls.set(BV_KEY(co.symbol),list);render();toast('✅ View added','ok',1500)}
+function bvCSV(){const co=activeCo();if(!co)return;const list=ls.get(BV_KEY(co.symbol),[]);
+  downloadText(toCSV([['Date','Broker / analyst','Rating','Target price','Source'],...list.map(v=>[v.date,v.broker,v.rating,v.target??'',v.link||''])]),`${shortName(co.name)}_broker_views.csv`)}
+
+function vViews(){const nd=needCo();if(nd)return nd;const{co,M}=ctx(),info=co.info||{};
+  const head=vhead('🗣️ Broker & Analyst Views',`${esc(co.name)} · consensus rating, price targets, estimates and broker views`);
+  if(!isListed(co))return head+`<div class="card-lite empty" style="padding:30px">🗣️ Analyst coverage is available for listed companies — search for one by name or ticker.</div>`;
+  const x=extraState('analyst',co);let top='',cards=[];
+  if(x.state==='loading')top=loadingCard('Fetching analyst consensus…');
+  else if(x.state==='error')top=errorCard(x.msg,'analyst');
+  else if(!x.d.available){top=`<div class="card-lite" style="padding:16px 18px;margin-bottom:16px">ℹ️ ${esc(x.d.reason||'No analyst coverage is available.')}</div>`}
+  else{const a=analystCards(co,x.d);top=a.kpis;cards=a.cards}
+  const d=x.d||{},px=d.currentPrice||info.currentPrice||info.regularMarketPrice,cur=d.currency||info.currency||M.cur;
+  cards.push(card('v-tracker','📝 My broker views tracker',bvTracker(co,px,cur),{span:12}));
+  if(x.state==='ok')cards.push(devsCard(d));
+  cards.push(card('v-links','🔗 Read the research',researchLinks(co),{span:12}));
+  return head+top+grid('views',cards)+`<p class="note">⚠️ Analyst ratings and targets are third-party opinions compiled by Yahoo Finance — not recommendations by this app, and not investment advice.</p>`}
+
+/* ---------- investor presentations, transcripts & other filings (BSE) ---------- */
+const IRKIND={presentation:['🎞️','Investor presentation'],transcript:['📝','Earnings call transcript'],recording:['🎧','Call recording'],meet:['👥','Analyst / investor meet'],results:['📊','Financial results'],annual:['📘','Annual report']};
+const IRF=[['key','⭐ Key documents'],['presentation','🎞️ Presentations'],['transcript','📝 Transcripts'],['recording','🎧 Call recordings'],['meet','👥 Analyst meets'],['results','📊 Results'],['annual','📘 Annual reports'],['all','🗂️ All']];
+const IRKEY=['presentation','transcript','recording'];
+function irListHTML(d){const f=S.irFilter||'key',q=(S.irQ||'').toLowerCase().trim();
+  const items=d.items.filter(i=>f==='all'||(f==='key'?IRKEY.includes(i.kind):i.kind===f)).filter(i=>!q||i.title.toLowerCase().includes(q));
+  if(!items.length)return'<div class="empty">📭 No documents match this filter in the last two years.</div>';
+  let last='',rows='';
+  items.forEach(i=>{const m=pmeta(i.date,true),grp=`${m.qL} · ${['Apr–Jun','Jul–Sep','Oct–Dec','Jan–Mar'][m.q-1]}`;
+    if(grp!==last){rows+=`<tr class="grp"><td colspan="4">${grp}</td></tr>`;last=grp}
+    const[ic,lab]=IRKIND[i.kind]||['📄',i.kind];
+    rows+=`<tr><td>${fmtDate(i.date)}</td><td><span class="chip">${ic} ${lab}</span></td><td style="white-space:normal">${esc(i.title)}</td><td>${i.url?`<a class="btn sm" href="${esc(i.url)}" target="_blank" rel="noopener noreferrer">📄 Open PDF</a>`:''}</td></tr>`});
+  return`<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Date</th><th>Type</th><th>Document</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`}
+function vIR(){const nd=needCo();if(nd)return nd;const{co}=ctx();
+  const head=vhead('🎤 Investor Presentations & Transcripts',`${esc(co.name)} · official filings on BSE · last two years`);
+  if(!isListed(co)||!/\.(NS|BO)$/i.test(co.symbol))return head+`<div class="card-lite empty" style="padding:30px">🎤 Presentations and earnings-call transcripts are available for companies listed on NSE / BSE.</div>`+(isListed(co)?grid('ir',[card('ir-links','🔗 Research links',researchLinks(co),{span:12})]):'');
+  const x=extraState('filings',co);
+  if(x.state==='loading')return head+loadingCard('Fetching presentations and transcripts from BSE…');
+  if(x.state==='error')return head+errorCard(x.msg,'filings')+grid('ir',[card('ir-links','🔗 Find them elsewhere',researchLinks(co),{span:12})]);
+  const d=x.d;if(!d.available)return head+`<div class="card-lite empty" style="padding:30px">ℹ️ ${esc(d.reason||'No filings found.')}</div>`+grid('ir',[card('ir-links','🔗 Research links',researchLinks(co),{span:12})]);
+  const hl=IRKEY.map(k=>{const it=d.items.find(i=>i.kind===k),[ic,lab]=IRKIND[k];
+    return it&&it.url?`<a class="card-lite ir-hl" href="${esc(it.url)}" target="_blank" rel="noopener noreferrer"><span class="ir-ic">${ic}</span><span><span class="note">Latest ${lab.toLowerCase()}</span><b>${esc(it.title)}</b><span class="note">${fmtDate(it.date)} · Open PDF ↗</span></span></a>`
+      :`<div class="card-lite ir-hl off"><span class="ir-ic">${ic}</span><span><span class="note">Latest ${lab.toLowerCase()}</span><b>None filed in the last two years</b></span></div>`}).join('');
+  const cnt=k=>k==='all'?d.items.length:k==='key'?d.items.filter(i=>IRKEY.includes(i.kind)).length:d.items.filter(i=>i.kind===k).length;
+  const chips=`<div class="fchips">${IRF.map(([k,l])=>`<span class="chip btnchip${(S.irFilter||'key')===k?' acc':''}" data-act="irf" data-f="${k}">${l} <b>${cnt(k)}</b></span>`).join('')}
+    <div class="search sm" style="margin-left:auto"><span>🔍</span><input data-role="ir-q" value="${esc(S.irQ||'')}" placeholder="Search documents…"></div></div>`;
+  return head+`<div class="ir-hls">${hl}</div>`+chips+`<div class="card-lite" style="padding:14px;margin-bottom:16px"><div id="ir-list">${irListHTML(d)}</div>
+    <div class="note" style="margin-top:8px">Source: corporate announcements filed with BSE (BSE scrip code ${esc(d.bseCode)}). Documents open from bseindia.com.</div></div>`
+    +grid('ir',[card('ir-links','🔗 More research links',researchLinks(co),{span:12})])}
+
 /* ---------- Guide ---------- */
 function vGuide(){return vhead('❓ Guide & Ratio Glossary','Everything you need to get started')+`<div class="grid guide">
   ${[['🚀 Getting started',`<ol><li>Type a <b>company name</b> (e.g. <i>Infosys</i>) or <b>ticker</b> in the search bar and press <b>Analyse</b>.</li><li>Choose <b>Annual / Quarterly</b>, then the <b>Year</b> and <b>Quarter</b> in the filter bar.</li><li>Move through the sections on the left: Overview → P&amp;L → Balance Sheet → Cash Flow → Ratios.</li><li>Add peers in <b>⚖️ Peer Comparison</b>.</li><li>Tap <b>🔗 Share</b> to send a link to what you are viewing, or <b>📱 Phone</b> to open it on your mobile.</li></ol>`],
     ['🔎 Ticker formats',`<p>🇮🇳 NSE: <code>RELIANCE.NS</code>, <code>TCS.NS</code><br>🇮🇳 BSE: <code>500325.BO</code> or <code>RELIANCE.BO</code><br>🇺🇸 US: <code>AAPL</code>, <code>MSFT</code><br>Names work too — “HDFC Bank”, “Tata Steel”.</p><p>ℹ️ Some companies (e.g. Infosys on Yahoo) report financials in USD — the currency is shown on every page and converted automatically in comparisons.</p>`],
     ['📑 Schedule III &amp; Ind AS',`<ul><li>The <b>📑 Schedule III</b> page presents the Balance Sheet, Statement of Profit and Loss and Statement of Cash Flows in the format of <b>Division II of Schedule III</b> to the Companies Act, 2013 (Ind AS companies), as amended in March 2021.</li><li>The Cash Flow Statement follows <b>Ind AS 7</b> (indirect method).</li><li><b>Schedule III ratios</b> (current, debt-equity, DSCR, ROE, turnover ratios, net profit, ROCE, ROI) are shown with the previous year and flag changes above 25%.</li><li>Items marked <b>*</b> are balancing figures; “—” means the source does not report the item separately. Upload your own Schedule III statements (see the template in Smart Upload) for exact line items.</li></ul>`],
+    ['🗣️ Analyst views &amp; 🎤 filings',`<ul><li><b>Broker &amp; Analyst Views</b> shows the analyst consensus, price-target range and upside, rating trend, EPS / revenue estimates and — where published — rating changes by named broking firms (source: Yahoo Finance).</li><li>Use the <b>My broker views tracker</b> to record views from broker reports you receive; it calculates upside and summarises them.</li><li><b>Presentations &amp; Transcripts</b> lists investor presentations, earnings-call transcripts, call recordings, analyst meets, results and annual reports filed on <b>BSE</b>, with direct PDF links.</li></ul>`],
     ['🖱️ Dashboard tips',`<ul><li><b>Drag</b> any card by its ⠿ handle to rearrange; ↔️ resizes it. Layout is remembered.</li><li>Click <b>legend items</b> to hide/show series; 📊📈🏔️ switch chart type.</li><li>⛶ expands a chart, ⬇️ saves it as PNG.</li><li>Press <code>/</code> to jump to search. Hover anything for details.</li><li>🖨️ Print → “Save as PDF” for reports.</li></ul>`],
     ['📱 Phone &amp; sharing',`<ul><li>Open the same address on any phone, tablet or computer. Charts respond to touch — tap for details, pinch to zoom.</li><li>Install it: <b>Share → Add to Home Screen</b> (iPhone) or <b>⋮ → Install app</b> (Android / Chrome).</li><li><b>🔗 Share</b> sends a link that opens the same companies and page.</li><li><b>Smart Upload</b> reads your files inside the browser — they are never sent to the server.</li><li>Source: Yahoo Finance. Figures may differ slightly from filed reports; verify before relying on them.</li></ul>`]].map(([t,b])=>`<div class="card span-6"><div class="card-body" style="padding:16px"><h3>${t}</h3>${b}</div></div>`).join('')}</div>
   <div class="card-lite" style="padding:16px"><div class="tbl-tools"><h3 style="margin:0">🧮 Ratio Glossary</h3><div class="search sm" style="margin-left:auto"><span>🔍</span><input data-role="gloss-q" placeholder="Search glossary…"></div></div>
   <div class="tbl-wrap" style="max-height:none"><table class="tbl gloss" id="gloss"><thead><tr><th>Group</th><th>Ratio</th><th>Formula</th><th>What it tells you</th><th>Rule-of-thumb benchmark</th></tr></thead><tbody>${RATIOS.map(d=>`<tr><td>${GROUPS.find(g=>g[0]===d.g)[1]} ${d.g}</td><td><b>${d.n}</b></td><td>${d.f}</td><td>${d.tip}</td><td>${benchText(d)}</td></tr>`).join('')}</tbody></table></div>
   <p class="note">⚠️ Benchmarks are generic rules of thumb; healthy levels vary by industry (e.g. banks, IT services and manufacturers look very different). Always compare with sector peers. This tool is for analysis and education, not investment advice.</p></div>`}
 /* ======================= 5. App shell, events, startup ======================= */
-const TABS=[['overview','🏠','Overview'],['pl','📈','Profit & Loss'],['bs','🏦','Balance Sheet'],['cf','💵','Cash Flow'],['s3','📑','Schedule III'],['ratios','🧮','Ratio Analysis'],['compare','⚖️','Peer Comparison'],['smart','📤','Smart Upload'],['guide','❓','Guide & Glossary']];
-const VIEWS={overview:vOverview,pl:vPL,bs:vBS,cf:vCF,s3:vS3,ratios:vRatios,compare:vCompare,smart:vSmart,guide:vGuide};
+const TABS=[['overview','🏠','Overview'],['pl','📈','Profit & Loss'],['bs','🏦','Balance Sheet'],['cf','💵','Cash Flow'],['s3','📑','Schedule III'],['ratios','🧮','Ratio Analysis'],['compare','⚖️','Peer Comparison'],['views','🗣️','Broker & Analyst Views'],['ir','🎤','Presentations & Transcripts'],['smart','📤','Smart Upload'],['guide','❓','Guide & Glossary']];
+const VIEWS={overview:vOverview,pl:vPL,bs:vBS,cf:vCF,s3:vS3,ratios:vRatios,compare:vCompare,views:vViews,ir:vIR,smart:vSmart,guide:vGuide};
 function toast(msg,tone='info',ms=3500){const t=document.createElement('div');t.className='toast '+tone;t.innerHTML=msg;$('#toasts').appendChild(t);setTimeout(()=>{t.classList.add('out');setTimeout(()=>t.remove(),350)},ms)}
 function render(){
   CHARTS.clear();const v=$('#view');
@@ -1087,6 +1219,11 @@ V.addEventListener('click',e=>{const a=e.target.closest('[data-act]');if(!a)retu
     case'ds-reset':S.ds.filters={};S.ds.q='';S.ds.page=0;render();break;
     case'ds-sort':{const j=+a.dataset.j,s=S.ds.sort;S.ds.sort=s&&s.j===j?(s.d===-1?{j,d:1}:null):{j,d:-1};$('#ds-table').innerHTML=dsTable(dsFiltered(S.ds));break}
     case'ds-page':S.ds.page=Math.max(0,S.ds.page+ +a.dataset.d);$('#ds-table').innerHTML=dsTable(dsFiltered(S.ds));break;
+    case'extra-retry':{const co=activeCo();if(co){delete EXTRA[a.dataset.k+'|'+co.symbol];render()}break}
+    case'irf':S.irFilter=a.dataset.f;render();break;
+    case'bv-add':bvAdd(a);break;
+    case'bv-del':{const co=activeCo();if(co){ls.set(BV_KEY(co.symbol),ls.get(BV_KEY(co.symbol),[]).filter(v=>v.id!==a.dataset.id));render()}break}
+    case'bv-csv':bvCSV();break;
     case's3tab':S.s3tab=a.dataset.t;render();break;
     case's3csv':{const cd2=a.closest('.card');if(cd2&&cd2.dataset.id&&cd2.dataset.id.startsWith('s3-'))S.s3tab=cd2.dataset.id.slice(3);s3CSV();break}
     case's3print':{const el=a.closest('.card,.card-lite');document.body.classList.add('printing');el.classList.add('print-target');print();setTimeout(()=>{document.body.classList.remove('printing');el.classList.remove('print-target')},400);break}
@@ -1097,6 +1234,7 @@ V.addEventListener('input',e=>{const el=e.target,role=el.dataset.role;if(!role)r
   inTimer=setTimeout(()=>{
     if(role==='tbl-q'){S.tbl[el.dataset.st].q=el.value;$('#tblw-'+el.dataset.st).innerHTML=stmtTable(el.dataset.st)}
     else if(role==='ratio-q'){S.ratioQ=el.value;$('#ratio-cards').innerHTML=ratioCardsHTML()}
+    else if(role==='ir-q'){S.irQ=el.value;const co=activeCo(),x=co&&EXTRA['filings|'+co.symbol];if(x&&x.state==='ok')$('#ir-list').innerHTML=irListHTML(x.d)}
     else if(role==='ds-q'){S.ds.q=el.value;S.ds.page=0;refreshDs()}
     else if(role==='gloss-q'){const q=el.value.toLowerCase();$$('#gloss tbody tr').forEach(tr=>tr.style.display=tr.textContent.toLowerCase().includes(q)?'':'none')}},180)});
 V.addEventListener('change',e=>{const el=e.target,role=el.dataset.role;if(!role)return;

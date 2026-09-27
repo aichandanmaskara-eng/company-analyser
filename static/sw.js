@@ -1,5 +1,5 @@
-/* Company Analyser service worker: app shell is cached for instant start; data (/api) always comes from the network. */
-const VERSION = 'ca-v2';  // bump on every release so visitors get the new version
+﻿/* Company Analyser service worker: app shell is cached for instant start; data (/api) always comes from the network. */
+const VERSION = 'ca-v3';  // bump on every release so visitors get the new version
 const SHELL = ['/', '/app.css', '/app.js', '/charts.js', '/vendor/echarts.min.js', '/vendor/Sortable.min.js',
   '/manifest.webmanifest', '/icons/icon-192.png'];
 
