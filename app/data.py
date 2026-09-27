@@ -163,7 +163,7 @@ def resolve(query: str) -> tuple[str, str | None]:
 
 
 # ---------------------------------------------------------------- download
-def _statement(symbol: str, stmt: str, freq: str) -> dict:
+def _statement(symbol: str, stmt: str, freq: str, currencies: set | None = None) -> dict:
     types = ",".join(freq + k for k in KEYS[stmt])
     js = Y.get(f"{Q2}/ws/fundamentals-timeseries/v1/finance/timeseries/{symbol}",
                {"symbol": symbol, "type": types, "period1": 493590046, "period2": int(time.time())})
@@ -173,6 +173,8 @@ def _statement(symbol: str, stmt: str, freq: str) -> dict:
         pts = [p for p in res.get(key) or [] if p and p.get("asOfDate")]
         if pts:
             series[key[len(freq):]] = {p["asOfDate"]: _num(p.get("reportedValue")) for p in pts}
+            if currencies is not None:
+                currencies.update(p["currencyCode"] for p in pts if p.get("currencyCode"))
     periods = sorted({d for s in series.values() for d in s})
     items = {}
     for k in KEYS[stmt]:  # keep Yahoo's statement order
@@ -181,6 +183,35 @@ def _statement(symbol: str, stmt: str, freq: str) -> dict:
             if any(v is not None for v in vals):
                 items[title(k)] = vals
     return {"periods": periods, "items": items}
+
+
+VALUATION = {"MarketCap": "marketCap", "EnterpriseValue": "enterpriseValue", "PeRatio": "trailingPE",
+             "ForwardPeRatio": "forwardPE", "PbRatio": "priceToBook", "PsRatio": "priceToSales", "PegRatio": "pegRatio",
+             "EnterprisesValueEBITDARatio": "enterpriseToEbitda", "EnterprisesValueRevenueRatio": "enterpriseToRevenue"}
+
+
+def _valuation(symbol: str) -> dict:
+    """Latest valuation measures (market cap, P/E, P/B, EV/EBITDA, …) — a service that needs no crumb,
+    so it also works from cloud servers where Yahoo refuses the quoteSummary service."""
+    now = int(time.time())
+    js = Y.get(f"{Q2}/ws/fundamentals-timeseries/v1/finance/timeseries/{symbol}",
+               {"symbol": symbol, "type": ",".join("trailing" + k for k in VALUATION),
+                "period1": now - 400 * 86400, "period2": now})
+    out = {}
+    for res in (js.get("timeseries") or {}).get("result") or []:
+        key = ((res.get("meta") or {}).get("type") or [""])[0]
+        pts = [p for p in res.get(key) or [] if p and _num(p.get("reportedValue")) is not None]
+        if pts and key.startswith("trailing") and key[8:] in VALUATION:
+            out[VALUATION[key[8:]]] = _num(max(pts, key=lambda p: p["asOfDate"])["reportedValue"])
+    return out
+
+
+def _profile(symbol: str) -> dict:
+    """Sector / industry from the search service (no crumb needed)."""
+    js = Y.get(f"{Q2}/v1/finance/search", {"q": symbol, "quotesCount": 5, "newsCount": 0, "listsCount": 0})
+    q = next((x for x in js.get("quotes", []) if (x.get("symbol") or "").upper() == symbol.upper()), {})
+    return {k: v for k, v in {"sector": q.get("sectorDisp") or q.get("sector"), "industry": q.get("industryDisp") or q.get("industry"),
+                              "longName": q.get("longname"), "exchange": q.get("exchDisp")}.items() if v}
 
 
 def _info(symbol: str, meta: dict) -> dict:
@@ -203,13 +234,27 @@ def _info(symbol: str, meta: dict) -> dict:
         if meta.get(theirs) not in (None, ""):
             info.setdefault(ours, meta[theirs])
     info.setdefault("currentPrice", info.get("regularMarketPrice"))
+    # Valuation measures always come from the crumb-free timeseries service: it works from cloud servers (where
+    # quoteSummary is refused) and handles companies that report in another currency correctly — quoteSummary
+    # divides a rupee enterprise value by dollar EBITDA for e.g. Infosys (EV/EBITDA 903× instead of 8×).
+    try:
+        info.update(_valuation(symbol))
+    except DataError:
+        pass
+    if not info.get("sector") or not info.get("industry"):
+        try:
+            for k, v in _profile(symbol).items():
+                if not info.get(k):
+                    info[k] = v
+        except DataError:
+            pass
     if isinstance(info.get("longBusinessSummary"), str):
         info["longBusinessSummary"] = info["longBusinessSummary"][:900]
     return {k: v for k, v in info.items() if v is not None}
 
 
 def _download(symbol: str) -> dict:
-    chart = Y.get(f"{Q2}/v8/finance/chart/{symbol}", {"range": "5y", "interval": "1mo"})
+    chart = Y.get(f"{Q2}/v8/finance/chart/{symbol}", {"range": "5y", "interval": "1mo", "events": "div"})
     res = ((chart.get("chart") or {}).get("result") or [None])[0]
     if not res:
         raise DataError(f"“{symbol}” was not found on Yahoo Finance. Check the ticker (NSE: .NS, BSE: .BO).")
@@ -217,15 +262,27 @@ def _download(symbol: str) -> dict:
     closes = (((res.get("indicators") or {}).get("quote") or [{}])[0]).get("close") or []
     price = [[datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d"), round(c, 2)]
              for t, c in zip(res.get("timestamp") or [], closes) if _num(c) is not None]
+    currencies: set = set()
+    annual = {s: _statement(symbol, s, "annual", currencies) for s in ("income", "balance", "cashflow")}
+    quarterly = {s: _statement(symbol, s, "quarterly", currencies) for s in ("income", "balance", "cashflow")}
     info = _info(symbol, meta)
+    if not info.get("financialCurrency") and len(currencies) == 1:  # e.g. Infosys reports in USD, trades in INR
+        info["financialCurrency"] = next(iter(currencies))
+    if info.get("dividendYield") is None:  # trailing-12-month dividends ÷ current price
+        cutoff = time.time() - 365 * 86400
+        divs = [_num(d.get("amount")) for d in ((res.get("events") or {}).get("dividends") or {}).values()
+                if (d.get("date") or 0) >= cutoff]
+        px = _num(info.get("currentPrice"))
+        if divs and px:
+            info["dividendYield"] = round(sum(v for v in divs if v) / px, 6)
     data = {
         "symbol": symbol,
         "name": info.get("longName") or info.get("shortName") or symbol,
         "source": "Yahoo Finance",
         "fetchedAt": datetime.now().isoformat(timespec="seconds"),
         "info": info,
-        "annual": {s: _statement(symbol, s, "annual") for s in ("income", "balance", "cashflow")},
-        "quarterly": {s: _statement(symbol, s, "quarterly") for s in ("income", "balance", "cashflow")},
+        "annual": annual,
+        "quarterly": quarterly,
         "price": price,
     }
     if not data["annual"]["income"]["periods"] and not data["quarterly"]["income"]["periods"]:
