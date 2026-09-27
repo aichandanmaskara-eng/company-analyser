@@ -28,7 +28,8 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # ---------------------------------------------------------------- light abuse protection for a public server
 _hits: dict[str, deque] = defaultdict(deque)
-LIMITS = {"/api/company": (30, 600), "/api/search": (120, 600), "/api/fx": (60, 600)}  # requests per window (s)
+LIMITS = {"/api/company": (30, 600), "/api/search": (120, 600), "/api/fx": (60, 600),
+          "/api/analyst": (40, 600), "/api/filings": (30, 600)}  # requests per window (s)
 
 
 def _client_ip(request: Request) -> str:
@@ -102,6 +103,22 @@ async def company(q: str = Query("", max_length=60), refresh: int = 0, cached: i
 async def fx(frm: str = Query("USD", alias="from", max_length=3), to: str = Query("INR", max_length=3)):
     try:
         return {"rate": await run_in_threadpool(data.fx_rate, frm, to)}
+    except Exception as exc:
+        return _error(exc)
+
+
+@app.get("/api/analyst")
+async def analyst(symbol: str = Query("", max_length=20)):
+    try:
+        return await run_in_threadpool(data.analyst, symbol)
+    except Exception as exc:
+        return _error(exc)
+
+
+@app.get("/api/filings")
+async def filings(symbol: str = Query("", max_length=20), name: str = Query("", max_length=120)):
+    try:
+        return await run_in_threadpool(data.filings, symbol, name)
     except Exception as exc:
         return _error(exc)
 

@@ -11,7 +11,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from curl_cffi import requests as http
@@ -84,15 +84,21 @@ class Yahoo:
         if self._crumb and not refresh:
             return self._crumb
         s = self._s()
-        try:
-            s.get("https://fc.yahoo.com", allow_redirects=True)
-        except Exception:
-            pass  # the cookie is set even when this page itself errors
-        crumb = s.get(f"{Q1}/v1/test/getcrumb").text.strip()
-        if not crumb or "<" in crumb or len(crumb) > 40:
-            raise DataError("Yahoo Finance did not accept the request. Please try again shortly.")
-        self._crumb = crumb
-        return crumb
+        # Two ways to obtain the session cookie; the second (a normal quote page) often works where the first is refused
+        for warm in ("https://fc.yahoo.com", "https://finance.yahoo.com/quote/AAPL/"):
+            try:
+                s.get(warm, allow_redirects=True)
+            except Exception:
+                pass  # the cookie is set even when this page itself errors
+            try:
+                crumb = s.get(f"{Q1}/v1/test/getcrumb").text.strip()
+            except Exception:
+                crumb = ""
+            if crumb and "<" not in crumb and len(crumb) <= 40:
+                self._crumb = crumb
+                return crumb
+        print("⚠️  Yahoo Finance refused the crumb request (common on cloud servers)", flush=True)
+        raise DataError("Yahoo Finance did not accept the request. Please try again shortly.")
 
 
 Y = Yahoo()
@@ -348,3 +354,177 @@ def fx_rate(frm: str, to: str) -> float:
         raise DataError(f"Exchange rate {frm}/{to} unavailable")
     _fx_cache[key] = (time.time(), rate)
     return rate
+
+
+# ---------------------------------------------------------------- analyst & broker views
+EXTRA_TTL = 6 * 3600
+_extra_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _cached(key: str, fn):
+    hit = _extra_cache.get(key)
+    if hit and time.time() - hit[0] < EXTRA_TTL:
+        return hit[1]
+    out = fn()
+    if out.get("available"):
+        _extra_cache[key] = (time.time(), out)
+    return out
+
+
+def _iso(ts) -> str | None:
+    try:
+        return datetime.fromtimestamp(int(ts), timezone.utc).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def analyst(symbol: str) -> dict:
+    """Consensus rating, price targets, rating trend, estimates and firm-level rating changes (Yahoo Finance)."""
+    symbol = symbol.strip().upper()
+    if not SYMBOL_RE.match(symbol):
+        raise DataError("Invalid symbol")
+
+    def build():
+        out = {"symbol": symbol, "available": False, "developments": []}
+        try:
+            js = Y.get(f"{Q2}/v10/finance/quoteSummary/{symbol}",
+                       {"modules": "financialData,recommendationTrend,upgradeDowngradeHistory,earningsTrend,price"}, crumb=True)
+            res = ((js.get("quoteSummary") or {}).get("result") or [{}])[0] or {}
+            fd, pr = res.get("financialData") or {}, res.get("price") or {}
+            trend = [{k: int(_num(t.get(k)) or 0) for k in ("strongBuy", "buy", "hold", "sell", "strongSell")} | {"period": t.get("period")}
+                     for t in (res.get("recommendationTrend") or {}).get("trend") or []]
+            changes = [{"date": _iso(h.get("epochGradeDate")), "firm": h.get("firm"), "to": h.get("toGrade"), "from": h.get("fromGrade"),
+                        "action": h.get("action"), "target": _num(h.get("currentPriceTarget")), "priorTarget": _num(h.get("priorPriceTarget"))}
+                       for h in ((res.get("upgradeDowngradeHistory") or {}).get("history") or [])[:40]]
+            est = []
+            for t in (res.get("earningsTrend") or {}).get("trend") or []:
+                e, rv = t.get("earningsEstimate") or {}, t.get("revenueEstimate") or {}
+                if _num(e.get("avg")) is None and _num(rv.get("avg")) is None:
+                    continue
+                est.append({"period": t.get("period"), "endDate": t.get("endDate"), "epsAvg": _num(e.get("avg")), "epsLow": _num(e.get("low")),
+                            "epsHigh": _num(e.get("high")), "epsAnalysts": _num(e.get("numberOfAnalysts")), "epsGrowth": _num(e.get("growth")),
+                            "yearAgoEps": _num(e.get("yearAgoEps")), "revAvg": _num(rv.get("avg")), "revAnalysts": _num(rv.get("numberOfAnalysts")),
+                            "revGrowth": _num(rv.get("growth"))})
+            out.update({
+                "available": bool(_num(fd.get("numberOfAnalystOpinions")) or trend or changes or est),
+                "currency": pr.get("currency") or fd.get("financialCurrency"),
+                "currentPrice": _num(fd.get("currentPrice")) or _num(pr.get("regularMarketPrice")),
+                "targetMean": _num(fd.get("targetMeanPrice")), "targetMedian": _num(fd.get("targetMedianPrice")),
+                "targetHigh": _num(fd.get("targetHighPrice")), "targetLow": _num(fd.get("targetLowPrice")),
+                "analysts": _num(fd.get("numberOfAnalystOpinions")), "recommendationKey": fd.get("recommendationKey"),
+                "recommendationMean": _num(fd.get("recommendationMean")), "trend": trend, "changes": changes, "estimates": est})
+            if not out["available"]:
+                out["reason"] = "No analyst coverage is published for this stock on Yahoo Finance."
+        except DataError as exc:
+            out["reason"] = f"Analyst consensus is unavailable right now — {exc}"
+        try:  # recent significant developments (no crumb needed)
+            js = Y.get(f"{Q2}/ws/insights/v2/finance/insights", {"symbol": symbol})
+            devs = ((js.get("finance") or {}).get("result") or {}).get("sigDevs") or []
+            out["developments"] = [{"date": d.get("date"), "headline": d.get("headline")} for d in devs[:10] if d.get("headline")]
+        except DataError:
+            pass
+        return out
+
+    return _cached("analyst|" + symbol, build)
+
+
+# ---------------------------------------------------------------- exchange filings (BSE): presentations, transcripts, …
+BSE_API = "https://api.bseindia.com/BseIndiaAPI/api"
+BSE_HEADERS = {"Referer": "https://www.bseindia.com/", "Origin": "https://www.bseindia.com", "Accept": "application/json, text/plain, */*"}
+BSE_ATTACH = "https://www.bseindia.com/xml-data/corpfiling/AttachHis/"  # holds recent and older documents ("AttachLive" drops older ones)
+_VAGUE = re.compile(r"please refer|enclosed|attached herewith|^presentation attached", re.I)
+
+
+def _filing_title(x: dict) -> str:
+    head = (x.get("HEADLINE") or "").strip()
+    subj = re.sub(r"^Announcement under Regulation 30 \(LODR\)\s*-\s*", "", (x.get("NEWSSUB") or "").strip(), flags=re.I)
+    return subj if (not head or len(head) < 30 or _VAGUE.search(head)) and subj else head or subj
+_bse_lock = threading.Lock()
+_bse_session = None
+
+
+def _bse_get(path: str, params: dict):
+    global _bse_session
+    with _bse_lock:
+        if _bse_session is None:
+            _bse_session = http.Session(impersonate="chrome", timeout=25)
+        try:
+            r = _bse_session.get(f"{BSE_API}/{path}", params=params, headers=BSE_HEADERS)
+        except Exception as exc:
+            raise DataError("Could not reach BSE (bseindia.com).") from exc
+    if r.status_code >= 400:
+        raise DataError(f"BSE returned an error ({r.status_code}).")
+    return r
+
+
+def bse_code(symbol: str, name: str = "") -> str | None:
+    base = symbol.split(".")[0].upper()
+    if base.isdigit():
+        return base
+    for text in (base, " ".join(name.split()[:2])):
+        if not text.strip():
+            continue
+        html = _bse_get("PeerSmartSearch/w", {"Type": "SS", "text": text}).text
+        for m in re.finditer(r"liclick\('(\d+)','([^']*)'\)", html):
+            span = re.search(r"<span>(.*?)</span>", html[m.end():m.end() + 500], re.S)
+            tokens = re.sub(r"<[^>]+>|&nbsp;|\\[nrt]", " ", span.group(1)).split() if span else []
+            if tokens and tokens[0].upper() == base:
+                return m.group(1)
+    return None
+
+
+FILING_KINDS = [  # (kind, test on sub-category, test on headline)
+    ("presentation", lambda sc: sc == "investor presentation", lambda h: "presentation" in h),
+    ("transcript", lambda sc: sc == "earnings call transcript", lambda h: "transcript" in h),
+    ("recording", lambda sc: False, lambda h: ("audio" in h or "video" in h or "webcast" in h) and ("call" in h or "meet" in h or "recording" in h)),
+    ("meet", lambda sc: sc == "analyst / investor meet", lambda h: "analyst" in h and ("meet" in h or "call" in h)),
+    ("annual", lambda sc: sc == "annual report", lambda h: "annual report" in h),
+    ("results", lambda sc: sc == "financial results", lambda h: "financial results" in h),
+]
+
+
+def filings(symbol: str, name: str = "", years: int = 2) -> dict:
+    """Investor presentations, earnings-call transcripts, recordings, analyst meets and results filed on BSE."""
+    symbol = symbol.strip().upper()
+    if not SYMBOL_RE.match(symbol):
+        raise DataError("Invalid symbol")
+    if not symbol.endswith((".NS", ".BO")):
+        return {"symbol": symbol, "available": False,
+                "reason": "Exchange filings (presentations, transcripts) are available for companies listed on NSE / BSE."}
+
+    def build():
+        code = bse_code(symbol, name)
+        if not code:
+            return {"symbol": symbol, "available": False, "reason": "Could not find this company's BSE scrip code."}
+        today = datetime.now()
+        start = today - timedelta(days=365 * years)
+        items, seen, rows_all = [], set(), []
+        for y in range(years):  # BSE accepts date ranges of at most one year
+            to_d, from_d = today - timedelta(days=365 * y), today - timedelta(days=365 * (y + 1) - 1)
+            for page in range(1, 9):
+                r = _bse_get("AnnSubCategoryGetData/w", {"pageno": page, "strCat": "-1", "strPrevDate": from_d.strftime("%Y%m%d"),
+                                                         "strScrip": code, "strSearch": "P", "strToDate": to_d.strftime("%Y%m%d"),
+                                                         "strType": "C", "subcategory": "-1"})
+                try:
+                    rows = r.json().get("Table") or []
+                except ValueError as exc:
+                    raise DataError("BSE returned an unexpected response.") from exc
+                rows_all.extend(rows)
+                if len(rows) < 50:
+                    break
+        for x in rows_all:
+            head = _filing_title(x)
+            sc, h = (x.get("SUBCATNAME") or "").strip().lower(), (head + " " + (x.get("HEADLINE") or "")).lower()
+            kind = next((k for k, by_sc, by_h in FILING_KINDS if by_sc(sc)), None) or \
+                next((k for k, by_sc, by_h in FILING_KINDS if by_h(h)), None)
+            att = (x.get("ATTACHMENTNAME") or "").strip()
+            key = (att or head, (x.get("NEWS_DT") or "")[:10])
+            if not kind or key in seen:
+                continue
+            seen.add(key)
+            items.append({"date": (x.get("NEWS_DT") or "")[:10], "kind": kind, "title": head, "category": x.get("SUBCATNAME"),
+                          "url": BSE_ATTACH + att if att else None})
+        items.sort(key=lambda i: i["date"], reverse=True)
+        return {"symbol": symbol, "available": True, "bseCode": code, "items": items, "from": start.strftime("%Y-%m-%d")}
+
+    return _cached("filings|" + symbol, build)
