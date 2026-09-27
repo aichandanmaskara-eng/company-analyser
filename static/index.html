@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Company Analyser</title>
+<meta name="description" content="Analyse the published financial results of any listed company — ratios, section-wise insights and peer comparison.">
+<meta name="theme-color" content="#4f46e5">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Company Analyser">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icons/icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="/icons/icon-180.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
+<link rel="stylesheet" href="/app.css">
+<script>try{var t=localStorage.getItem('ca-theme');document.documentElement.setAttribute('data-theme',t?JSON.parse(t):(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'))}catch(e){document.documentElement.setAttribute('data-theme','light')}</script>
+</head>
+<body>
+<aside class="sidebar" id="sidebar">
+  <div class="brand"><span class="logo">📊</span><span>Company Analyser</span></div>
+  <nav class="nav" id="nav"></nav>
+  <div class="side-sec"><div class="side-title">📁 Loaded companies</div><div id="loadedList"></div></div>
+  <div class="side-foot" id="sideFoot">Data: Yahoo Finance · For analysis &amp; education only · Online edition</div>
+</aside>
+<div class="scrim" id="scrim"></div>
+<main>
+  <header class="topbar">
+    <button class="btn" id="menuBtn" aria-label="Menu">☰</button>
+    <div class="search"><span>🔍</span><input id="q" autocomplete="off" placeholder="Enter company name or ticker — e.g. Infosys, TCS.NS, Reliance   (press / )"><div class="suggest" id="suggest"></div></div>
+    <button class="btn primary" id="goBtn">🚀 Analyse</button>
+    <div class="theme-switch" id="themeSwitch">
+      <button data-theme="light" title="Light mode">☀️ <span>Light</span></button>
+      <button data-theme="dark" title="Dark mode">🌙 <span>Dark</span></button>
+      <button data-theme="pro" title="Professional (Power BI style)">📊 <span>Pro</span></button>
+    </div>
+  </header>
+  <div class="filterbar">
+    <div class="fgroup">🗓️ <div class="seg" id="freqSeg"><button data-f="annual">Annual</button><button data-f="quarterly">Quarterly</button></div></div>
+    <div class="fgroup">📅 Year <select id="yearSel"></select></div>
+    <div class="fgroup">🧭 Quarter <select id="qSel"></select></div>
+    <div class="fgroup">🔢 Units <select id="unitSel"><option value="auto">Auto</option><option value="cr">Crore</option><option value="lakh">Lakh</option><option value="mn">Million</option><option value="bn">Billion</option><option value="raw">Absolute</option></select></div>
+    <span class="spacer"></span>
+    <button class="btn sm" id="refreshBtn" title="Download the latest published results again">🔄 Refresh</button>
+    <button class="btn sm" id="exportBtn" title="Share a link to this view">🔗 Share</button>
+    <button class="btn sm" id="phoneBtn" title="Open on your phone (QR code)">📱 Phone</button>
+    <button class="btn sm" id="printBtn" title="Print or save as PDF">🖨️ Print</button>
+    <span class="pill" id="statusPill">…</span>
+  </div>
+  <section id="view"></section>
+</main>
+<div id="tip" class="tip"></div>
+<div id="modal" class="modal"><div class="modal-box"><div class="modal-head"><b id="modalTitle"></b><button class="btn sm" id="modalClose">✕ Close</button></div><div id="modalBody"></div></div></div>
+<div id="toasts"></div>
+<script src="/vendor/echarts.min.js"></script>
+<script src="/vendor/Sortable.min.js"></script>
+<script src="/charts.js"></script>
+<script src="/app.js"></script>
+<script>
+if('serviceWorker' in navigator && window.isSecureContext) navigator.serviceWorker.register('/sw.js').catch(function(){});
+</script>
+</body>
+</html>
